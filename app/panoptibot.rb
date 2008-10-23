@@ -151,8 +151,10 @@ while true
       next if parse_command(msg.body, from_user)
       Message.new(:body => msg.body, :nick => from_user.nick, :im_userid => msg.from.strip.to_s, :user => from_user).save
     
+      omit_user = User.find_by_nick($1) if msg.body.match(/^\-(\w+)\s/)
+    
       online_users.each do |u|
-        next if u.login == from_user.login # don't send the message to the originating user
+        next if (u.login == from_user.login) or (omit_user and u.login == omit_user.login) # don't send the message to the originating or  omitted user
         send_message(u, msg.body, from_user)
       end
     end
