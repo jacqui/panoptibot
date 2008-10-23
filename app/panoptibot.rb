@@ -5,14 +5,20 @@ require 'xmpp4r-simple'
 require 'yaml'
 require 'logger'
 
-BASE_URL = "http://someserver/bot/messages"
-BOT_NAME = "panoptibot"
+BASE_URL = "http://someserver/bot/messages" unless Object.const_defined? :BASE_URL
+BOT_NAME = "panoptibot" unless Object.const_defined? :BOT_NAME
 
-bot_config = YAML.load_file(RAILS_ROOT + '/config/bots.yml')[RAILS_ENV].symbolize_keys
+if ENV['HOME'] && File.exist?(File.join(ENV['HOME'], '.panoptibot.yml'))
+  config_file = File.join(ENV['HOME'], '.panoptibot.yml')
+else
+  config_file = File.join(RAILS_ROOT, 'config', 'bots.yml')
+end
+bot_config = YAML.load_file(config_file)[RAILS_ENV].symbolize_keys
+
 @jabber = Jabber::Simple.new(bot_config[:username], bot_config[:password])
 
 HELP_MESSAGE = "commands are /hist [1,1..100], /nick [new nick name], /who, /quiet, /resume, /search [string]"
-SEND_MESSAGE_STATUSES = ['online', 'dnd', 'away']
+SEND_MESSAGE_STATUSES = ['online', 'dnd', 'away', 'ghost']
 
 def can_send_message?(status)
   SEND_MESSAGE_STATUSES.include?(status.to_s)
@@ -24,11 +30,6 @@ end
 
 def bot_user
   bot ||= User.new(:login => BOT_NAME, :nick => BOT_NAME)
-end
-
-def log(message)
-  @logger ||= Logger.new(RAILS_ROOT + "/log/bot-#{RAILS_ENV}.log")
-  @logger.info("[#{Time.now}] #{message}")
 end
 
 def parse_command(message, user)
@@ -112,6 +113,8 @@ end
 
 def send_message(to, body, from = nil)
   from ||= bot_user
+  to = to.login if to.respond_to? :login
+  
   message = Jabber::Message.new
   message.body = "#{from.nick}: #{body}"
   message.type = :chat
@@ -125,9 +128,20 @@ def send_message(to, body, from = nil)
   b.add(t)
   h.add(b)
   message.add_element(h)
-  @jabber.deliver(to.login, message)
+  @jabber.deliver(to, message)
 end
 
+if STDIN.isatty
+  logger = Logger.new(STDERR)
+  if RAILS_ENV == "production"
+    logger.level = Logger::INFO
+  else
+    logger.level = Logger::DEBUG
+  end
+  Object.send :remove_const, :RAILS_DEFAULT_LOGGER
+  Object.const_set :RAILS_DEFAULT_LOGGER, logger
+  RAILS_DEFAULT_LOGGER.info("Starting Panoptibot")
+end
 
 ##################
 # Main server loop
@@ -137,45 +151,53 @@ while true
 
   begin
     while @jabber.connected? != true
-      log("disconnected - trying to recconect")
+      RAILS_DEFAULT_LOGGER.info("Panoptibot: Disconnected - trying to reconnect")
       @jabber.connect
       sleep 30 unless jabber.connected?
     end
     
     @jabber.received_messages do |msg|
+      RAILS_DEFAULT_LOGGER.debug("Panoptibot: Message (#{msg.type}) from from #{msg.from.strip.to_s}")
       next unless msg.type == :chat
     
       from_user = User.find_by_login(msg.from.strip.to_s)
+      RAILS_DEFAULT_LOGGER.debug("  Unknown Sender!!!") unless from_user
       next unless from_user
+      
+      unless can_send_message?(from_user.status)
+        RAILS_DEFAULT_LOGGER.debug "  User was not known to be online, marking as 'ghost'"
+        from_user.status = 'ghost'   # sometimes users won't send presence updates but still be online
+        from_user.save
+      end
     
       next if parse_command(msg.body, from_user)
       Message.new(:body => msg.body, :nick => from_user.nick, :im_userid => msg.from.strip.to_s, :user => from_user).save
-    
       omit_user = User.find_by_nick($1) if msg.body.match(/^\-(\w+)\s/)
     
       online_users.each do |u|
         next if (u.login == from_user.login) or (omit_user and u.login == omit_user.login) # don't send the message to the originating or  omitted user
+        RAILS_DEFAULT_LOGGER.debug("  broadcasting the message")
         send_message(u, msg.body, from_user)
       end
     end
   
     @jabber.new_subscriptions do |user_id, presence|
       user_id = user_id.jid.to_s
-      log("new user req - #{user_id}")
+      RAILS_DEFAULT_LOGGER.info("Panoptibot: new user req - #{user_id}")
     
       # Add a user only if they are in the DB
       add_user(user_id) if(User.find_by_login(user_id))
     end
   
     @jabber.subscription_requests do |user_id, presence|
-      log("sub request from #{user_id}: #{presence}")
+      RAILS_DEFAULT_LOGGER.info("Panoptibot: sub request from #{user_id}: #{presence}")
     
       # Add a user only if they are in the DB
       add_user(user_id) if(User.find_by_login(user_id))
     end 
   
     @jabber.presence_updates do |user_id, new_presence|
-      log("presence update #{user_id} - #{new_presence}")
+      RAILS_DEFAULT_LOGGER.info("Panoptibot: presence update #{user_id} - #{new_presence}")
 
       from_user = User.find_by_login(user_id)
       remove_user(user_id) unless from_user
@@ -184,14 +206,14 @@ while true
          old_presence = from_user.status
          from_user.update_attribute(:status, new_presence)
 
-         log("presence update success #{user_id} - #{new_presence}")
+         RAILS_DEFAULT_LOGGER.info("Panoptibot: presence update success #{user_id} - #{new_presence}")
        
          if(old_presence == 'unavailable' and can_send_message?(new_presence))
            users = online_users.collect {|u| u.nick || u.login }
            send_message(user_id, "Hello komrade, I am currently monitoring: #{users.join(", ")}")
            send_message(user_id, "History at #{BASE_URL}/messages or /h")
            send_message(user_id, "Last 10 messages")
-           messge += Messages.history(10).collect {|m| m.to_s }.join("\n")
+           message = Messages.history(10).collect {|m| m.to_s }.join("\n")
            send_message(user_id, message)
          end
       end
@@ -199,6 +221,6 @@ while true
   
     sleep 2
   rescue StandardError => e
-    log("bot error - #{e.message}\n#{e.backtrace.join("\n")}")
+    RAILS_DEFAULT_LOGGER.debug("Panoptibot error: #{e.message}\n#{e.backtrace.join("\n")}")
   end
 end
